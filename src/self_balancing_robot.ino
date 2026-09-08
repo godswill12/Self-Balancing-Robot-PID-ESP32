@@ -111,11 +111,13 @@ const float TAU = 0.75;
 // OUTER VELOCITY PI CONTROLLER
 // =====================================================
 //
-// Stage 6:
+// Stage 7:
 //
 // Target velocity
 //       ↓
 // Velocity PI
+//       ↓
+// Gating + Anti-Windup
 //       ↓
 // Angle target
 //       ↓
@@ -124,6 +126,7 @@ const float TAU = 0.75;
 // Velocity is measured in encoder counts/second.
 // We intentionally do not convert to RPM yet.
 // =====================================================
+
 
 // Desired robot wheel velocity
 
@@ -151,6 +154,25 @@ const float VELOCITY_INTEGRAL_LIMIT = 5000.0;
 // Maximum angle command produced by velocity controller
 
 const float MAX_VELOCITY_ANGLE_COMMAND = 8.0;
+
+
+// =====================================================
+// VELOCITY LOOP GATING
+// =====================================================
+//
+// The outer velocity controller is only active when
+// the robot is reasonably close to its balance angle.
+//
+// If the robot moves farther than this angle from
+// baseTargetAngle, the velocity loop is disabled and
+// targetAngle returns to baseTargetAngle.
+//
+// This is NOT full fall detection.
+// =====================================================
+
+const float VELOCITY_LOOP_ANGLE_ERROR_LIMIT = 10.0;
+
+bool velocityLoopEnabled = false;
 
 
 // =====================================================
@@ -561,6 +583,8 @@ void resetVelocityPI()
 
   velocityIntegral = 0.0;
 
+  velocityLoopEnabled = false;
+
   targetAngle =
       baseTargetAngle;
 }
@@ -568,6 +592,13 @@ void resetVelocityPI()
 
 // =====================================================
 // OUTER VELOCITY PI CONTROLLER
+// =====================================================
+//
+// Stage 7 additions:
+//
+// 1. Velocity-loop gating
+// 2. Integral anti-windup
+//
 // =====================================================
 
 void updateVelocityPI(float dt)
@@ -593,34 +624,79 @@ void updateVelocityPI(float dt)
 
 
   // ---------------------------------------------------
-  // INTEGRAL
+  // VELOCITY LOOP GATING
+  // ---------------------------------------------------
+  //
+  // Compare the current angle with the physical
+  // balance angle established during startup.
+  //
+  // If the robot is too far away from the balance
+  // region, disable the outer velocity controller.
+  //
+  // This prevents the velocity controller from
+  // commanding additional leaning while the robot
+  // is already significantly displaced.
   // ---------------------------------------------------
 
-  velocityIntegral +=
-      velocityError * dt;
+  float angleErrorFromBalance =
+      currentAngle - baseTargetAngle;
 
 
-  velocityIntegral =
-      constrain(
-          velocityIntegral,
-          -VELOCITY_INTEGRAL_LIMIT,
-          VELOCITY_INTEGRAL_LIMIT
-      );
+  if (fabs(angleErrorFromBalance) >
+      VELOCITY_LOOP_ANGLE_ERROR_LIMIT)
+  {
+    velocityLoopEnabled = false;
+
+    // Clear the velocity integral so the controller
+    // cannot resume with accumulated error.
+    velocityIntegral = 0.0;
+
+    targetAngle =
+        baseTargetAngle;
+
+    return;
+  }
+
+
+  velocityLoopEnabled = true;
 
 
   // ---------------------------------------------------
-  // PI TERMS
+  // PROPORTIONAL TERM
   // ---------------------------------------------------
 
   float P =
       velocityKp * velocityError;
 
+
+  // ---------------------------------------------------
+  // PROVISIONAL INTEGRAL
+  // ---------------------------------------------------
+  //
+  // Calculate what the integral WOULD become.
+  // We only accept this update if anti-windup
+  // conditions allow it.
+  // ---------------------------------------------------
+
+  float proposedIntegral =
+      velocityIntegral
+      + velocityError * dt;
+
+
+  proposedIntegral =
+      constrain(
+          proposedIntegral,
+          -VELOCITY_INTEGRAL_LIMIT,
+          VELOCITY_INTEGRAL_LIMIT
+      );
+
+
   float I =
-      velocityKi * velocityIntegral;
+      velocityKi * proposedIntegral;
 
 
   // ---------------------------------------------------
-  // VELOCITY CONTROLLER OUTPUT
+  // PROVISIONAL VELOCITY OUTPUT
   // ---------------------------------------------------
 
   float velocityAngleCommand =
@@ -628,8 +704,102 @@ void updateVelocityPI(float dt)
 
 
   // ---------------------------------------------------
-  // LIMIT ANGLE COMMAND
+  // LIMIT VELOCITY ANGLE COMMAND
   // ---------------------------------------------------
+
+  float limitedVelocityAngleCommand =
+      constrain(
+          velocityAngleCommand,
+          -MAX_VELOCITY_ANGLE_COMMAND,
+          MAX_VELOCITY_ANGLE_COMMAND
+      );
+
+
+  // ---------------------------------------------------
+  // INTEGRAL ANTI-WINDUP
+  // ---------------------------------------------------
+  //
+  // If the velocity controller is not saturated,
+  // accept the integral update.
+  //
+  // If the controller IS saturated:
+  //
+  // Positive saturation:
+  //   only integrate if velocity error is negative.
+  //
+  // Negative saturation:
+  //   only integrate if velocity error is positive.
+  //
+  // This prevents the integral from making an existing
+  // saturation worse.
+  // ---------------------------------------------------
+
+  bool outputSaturated =
+      (velocityAngleCommand !=
+       limitedVelocityAngleCommand);
+
+
+  bool errorReducesSaturation =
+      false;
+
+
+  if (outputSaturated)
+  {
+    if (velocityAngleCommand >
+        MAX_VELOCITY_ANGLE_COMMAND)
+    {
+      // Controller is saturated positively.
+      //
+      // Negative error will reduce the output.
+
+      if (velocityError < 0.0)
+      {
+        errorReducesSaturation = true;
+      }
+    }
+
+    else if (velocityAngleCommand <
+             -MAX_VELOCITY_ANGLE_COMMAND)
+    {
+      // Controller is saturated negatively.
+      //
+      // Positive error will reduce the output.
+
+      if (velocityError > 0.0)
+      {
+        errorReducesSaturation = true;
+      }
+    }
+  }
+
+
+  // ---------------------------------------------------
+  // ACCEPT OR REJECT INTEGRAL UPDATE
+  // ---------------------------------------------------
+
+  if (!outputSaturated ||
+      errorReducesSaturation)
+  {
+    velocityIntegral =
+        proposedIntegral;
+  }
+
+
+  // ---------------------------------------------------
+  // RECALCULATE INTEGRAL TERM
+  // ---------------------------------------------------
+
+  I =
+      velocityKi * velocityIntegral;
+
+
+  // ---------------------------------------------------
+  // FINAL VELOCITY CONTROLLER OUTPUT
+  // ---------------------------------------------------
+
+  velocityAngleCommand =
+      P + I;
+
 
   velocityAngleCommand =
       constrain(
@@ -667,7 +837,7 @@ void setupMotors()
   digitalWrite(STBY_PIN, HIGH);
 
 
-  // Same LEDC API used in Stage 4.
+  // Same LEDC API used in previous stages.
 
   ledcSetup(0, PWM_FREQ, PWM_RESOLUTION);
   ledcSetup(1, PWM_FREQ, PWM_RESOLUTION);
@@ -1034,12 +1204,12 @@ void setup()
 
 
   // ---------------------------------------------------
-  // STAGE 6 MESSAGE
+  // STAGE 7 MESSAGE
   // ---------------------------------------------------
 
-  Serial.println("================================");
-  Serial.println("   STAGE 6 - VELOCITY PI CONTROL");
-  Serial.println("================================");
+  Serial.println("==============================================");
+  Serial.println(" STAGE 7 - VELOCITY GATING + ANTI-WINDUP");
+  Serial.println("==============================================");
   Serial.println();
 
   Serial.println(
@@ -1062,6 +1232,14 @@ void setup()
       "Outer velocity PI active."
   );
 
+  Serial.println(
+      "Velocity-loop gating active."
+  );
+
+  Serial.println(
+      "Velocity integral anti-windup active."
+  );
+
   Serial.println();
 
   Serial.print("Angle Kp: ");
@@ -1078,6 +1256,17 @@ void setup()
 
   Serial.print("Velocity Ki: ");
   Serial.println(velocityKi);
+
+  Serial.print("Velocity integral limit: ");
+  Serial.println(VELOCITY_INTEGRAL_LIMIT);
+
+  Serial.print("Maximum velocity angle command: ");
+  Serial.print(MAX_VELOCITY_ANGLE_COMMAND);
+  Serial.println(" °");
+
+  Serial.print("Velocity loop angle limit: ");
+  Serial.print(VELOCITY_LOOP_ANGLE_ERROR_LIMIT);
+  Serial.println(" °");
 
   Serial.print("Target velocity: ");
   Serial.print(targetVelocity, 2);
@@ -1228,8 +1417,10 @@ void loop()
   // UPDATE VELOCITY PI
   // ---------------------------------------------------
   //
-  // The velocity loop runs using the same main-loop
-  // timing. Encoder velocity itself updates every 20 ms.
+  // Stage 7:
+  //
+  // The velocity loop is gated according to angle.
+  // Its integral is protected against windup.
   //
 
   updateVelocityPI(dt);
@@ -1289,6 +1480,13 @@ void loop()
   Serial.print(" | Vel I: ");
   Serial.print(velocityIntegral, 2);
 
+  Serial.print(" | Vel Loop: ");
+  Serial.print(
+      velocityLoopEnabled
+      ? "ON"
+      : "OFF"
+  );
+
   Serial.print(" | Angle Error: ");
   Serial.print(error, 2);
 
@@ -1313,7 +1511,9 @@ void loop()
   Serial.println(" ms");
 
 
-  // Small loop delay
+  // ---------------------------------------------------
+  // SMALL LOOP DELAY
+  // ---------------------------------------------------
 
   delay(5);
 }
