@@ -31,6 +31,63 @@ const int PWM_RESOLUTION = 8;
 
 
 // =====================================================
+// ENCODERS
+// =====================================================
+
+// Left encoder
+
+#define ENC_LEFT_A 34
+#define ENC_LEFT_B 35
+
+// Right encoder
+
+#define ENC_RIGHT_A 32
+#define ENC_RIGHT_B 33
+
+
+// =====================================================
+// ENCODER COUNTERS
+// =====================================================
+//
+// volatile is required because these variables are
+// modified inside interrupt service routines.
+//
+
+volatile long leftEncoderCount = 0;
+volatile long rightEncoderCount = 0;
+
+
+// =====================================================
+// ENCODER DIRECTION
+// =====================================================
+//
+// Change these later if the physical encoder direction
+// is opposite to the desired sign.
+//
+
+const int ENC_LEFT_SIGN = 1;
+const int ENC_RIGHT_SIGN = 1;
+
+
+// =====================================================
+// ENCODER VELOCITY
+// =====================================================
+
+float leftVelocity = 0.0;
+float rightVelocity = 0.0;
+
+long previousLeftCount = 0;
+long previousRightCount = 0;
+
+
+// Velocity measurement interval
+
+const unsigned long VELOCITY_INTERVAL_MS = 20;
+
+unsigned long previousVelocityTime = 0;
+
+
+// =====================================================
 // SENSOR VALUES
 // =====================================================
 
@@ -63,20 +120,6 @@ const float TAU = 0.75;
 
 // =====================================================
 // ANGLE PID CONTROLLER
-// =====================================================
-//
-// Inner-loop controller:
-//
-//     targetAngle
-//          ↓
-//        Error
-//          ↓
-//      Angle PID
-//          ↓
-//     Motor command
-//
-// The PID controls the robot's body angle.
-//
 // =====================================================
 
 float targetAngle = 0.0;
@@ -270,6 +313,194 @@ void calibrateGyro()
 
 
 // =====================================================
+// LEFT ENCODER ISR
+// =====================================================
+
+void IRAM_ATTR leftEncoderISR()
+{
+  bool channelB =
+      digitalRead(ENC_LEFT_B);
+
+  if (channelB)
+  {
+    leftEncoderCount -= ENC_LEFT_SIGN;
+  }
+  else
+  {
+    leftEncoderCount += ENC_LEFT_SIGN;
+  }
+}
+
+
+// =====================================================
+// RIGHT ENCODER ISR
+// =====================================================
+
+void IRAM_ATTR rightEncoderISR()
+{
+  bool channelB =
+      digitalRead(ENC_RIGHT_B);
+
+  if (channelB)
+  {
+    rightEncoderCount -= ENC_RIGHT_SIGN;
+  }
+  else
+  {
+    rightEncoderCount += ENC_RIGHT_SIGN;
+  }
+}
+
+
+// =====================================================
+// ENCODER SETUP
+// =====================================================
+
+void setupEncoders()
+{
+  pinMode(
+      ENC_LEFT_A,
+      INPUT
+  );
+
+  pinMode(
+      ENC_LEFT_B,
+      INPUT
+  );
+
+  pinMode(
+      ENC_RIGHT_A,
+      INPUT
+  );
+
+  pinMode(
+      ENC_RIGHT_B,
+      INPUT
+  );
+
+
+  attachInterrupt(
+      digitalPinToInterrupt(ENC_LEFT_A),
+      leftEncoderISR,
+      RISING
+  );
+
+
+  attachInterrupt(
+      digitalPinToInterrupt(ENC_RIGHT_A),
+      rightEncoderISR,
+      RISING
+  );
+
+
+  Serial.println("Encoder feedback initialized.");
+
+  Serial.print("Left encoder A: GPIO ");
+  Serial.println(ENC_LEFT_A);
+
+  Serial.print("Left encoder B: GPIO ");
+  Serial.println(ENC_LEFT_B);
+
+  Serial.print("Right encoder A: GPIO ");
+  Serial.println(ENC_RIGHT_A);
+
+  Serial.print("Right encoder B: GPIO ");
+  Serial.println(ENC_RIGHT_B);
+
+  Serial.println();
+}
+
+
+// =====================================================
+// READ ENCODER COUNTS
+// =====================================================
+
+void readEncoderCounts(
+    long &leftCount,
+    long &rightCount)
+{
+  noInterrupts();
+
+  leftCount =
+      leftEncoderCount;
+
+  rightCount =
+      rightEncoderCount;
+
+  interrupts();
+}
+
+
+// =====================================================
+// CALCULATE WHEEL VELOCITY
+// =====================================================
+//
+// Velocity here is measured in:
+//
+//     encoder counts / second
+//
+// We intentionally use encoder counts/s at Stage 5.
+// Physical wheel RPM can be added later once the exact
+// encoder counts-per-revolution specification is verified.
+//
+
+void updateWheelVelocity()
+{
+  unsigned long now =
+      millis();
+
+
+  unsigned long elapsed =
+      now - previousVelocityTime;
+
+
+  if (elapsed < VELOCITY_INTERVAL_MS)
+    return;
+
+
+  long leftCount;
+  long rightCount;
+
+
+  readEncoderCounts(
+      leftCount,
+      rightCount
+  );
+
+
+  long deltaLeft =
+      leftCount - previousLeftCount;
+
+  long deltaRight =
+      rightCount - previousRightCount;
+
+
+  float dt =
+      elapsed / 1000.0;
+
+
+  if (dt > 0.0)
+  {
+    leftVelocity =
+        deltaLeft / dt;
+
+    rightVelocity =
+        deltaRight / dt;
+  }
+
+
+  previousLeftCount =
+      leftCount;
+
+  previousRightCount =
+      rightCount;
+
+  previousVelocityTime =
+      now;
+}
+
+
+// =====================================================
 // MOTOR SETUP
 // =====================================================
 
@@ -287,7 +518,7 @@ void setupMotors()
   digitalWrite(STBY_PIN, HIGH);
 
 
-  // Same LEDC API used in Stage 3.
+  // Same LEDC API used in Stage 4.
 
   ledcSetup(0, PWM_FREQ, PWM_RESOLUTION);
   ledcSetup(1, PWM_FREQ, PWM_RESOLUTION);
@@ -307,7 +538,12 @@ void setupMotors()
 
 void driveMotorA(int speed)
 {
-  speed = constrain(speed, -255, 255);
+  speed =
+      constrain(
+          speed,
+          -255,
+          255
+      );
 
 
   if (speed > 0)
@@ -329,7 +565,10 @@ void driveMotorA(int speed)
   }
 
 
-  ledcWrite(0, abs(speed));
+  ledcWrite(
+      0,
+      abs(speed)
+  );
 }
 
 
@@ -339,7 +578,12 @@ void driveMotorA(int speed)
 
 void driveMotorB(int speed)
 {
-  speed = constrain(speed, -255, 255);
+  speed =
+      constrain(
+          speed,
+          -255,
+          255
+      );
 
 
   if (speed > 0)
@@ -361,27 +605,29 @@ void driveMotorB(int speed)
   }
 
 
-  ledcWrite(1, abs(speed));
+  ledcWrite(
+      1,
+      abs(speed)
+  );
 }
 
 
 // =====================================================
 // DRIVE BOTH MOTORS
 // =====================================================
-//
-// Motor B is inverted relative to Motor A,
-// matching the existing robot configuration.
-//
 
 void driveMotors(float power)
 {
-  int pwm = (int)power;
+  int pwm =
+      (int)power;
 
-  pwm = constrain(
-      pwm,
-      -255,
-      255
-  );
+
+  pwm =
+      constrain(
+          pwm,
+          -255,
+          255
+      );
 
 
   driveMotorA(pwm);
@@ -400,7 +646,8 @@ void resetPID()
 
   previousError = 0.0;
 
-  previousAngle = currentAngle;
+  previousAngle =
+      currentAngle;
 
   errorSum = 0.0;
 }
@@ -412,33 +659,17 @@ void resetPID()
 
 float calculateAnglePID(float dt)
 {
-  // ---------------------------------------------------
   // ERROR
-  // ---------------------------------------------------
 
   error =
       targetAngle - currentAngle;
 
 
-  // ---------------------------------------------------
   // INTEGRAL
-  // ---------------------------------------------------
-  //
-  // Integral:
-  //
-  // errorSum = ∫ error dt
-  //
-  // Discrete implementation:
-  //
-  // errorSum += error * dt
-  //
-  // ---------------------------------------------------
 
   errorSum +=
       error * dt;
 
-
-  // Anti-windup
 
   errorSum =
       constrain(
@@ -448,16 +679,7 @@ float calculateAnglePID(float dt)
       );
 
 
-  // ---------------------------------------------------
   // ANGULAR RATE
-  // ---------------------------------------------------
-  //
-  // Derivative is calculated from the measured angle
-  // rather than directly from the error.
-  //
-  // This avoids derivative kick if targetAngle changes.
-  //
-  // ---------------------------------------------------
 
   float angleRate = 0.0;
 
@@ -465,37 +687,28 @@ float calculateAnglePID(float dt)
   if (dt > 0.0)
   {
     angleRate =
-        (currentAngle - previousAngle) / dt;
+        (currentAngle - previousAngle)
+        / dt;
   }
 
 
-  // ---------------------------------------------------
   // PID TERMS
-  // ---------------------------------------------------
 
   float P =
       Kp * error;
 
-
   float I =
       Ki * errorSum;
-
 
   float D =
       -Kd * angleRate;
 
 
-  // ---------------------------------------------------
-  // TOTAL PID OUTPUT
-  // ---------------------------------------------------
+  // TOTAL OUTPUT
 
   float output =
       P + I + D;
 
-
-  // ---------------------------------------------------
-  // MOTOR OUTPUT LIMIT
-  // ---------------------------------------------------
 
   output =
       constrain(
@@ -538,8 +751,6 @@ void setup()
   // MPU6050 CONFIGURATION
   // ---------------------------------------------------
 
-  // Wake MPU6050
-
   writeRegister(
       0x6B,
       0x00
@@ -547,8 +758,6 @@ void setup()
 
   delay(100);
 
-
-  // Accelerometer ±2g
 
   writeRegister(
       0x1C,
@@ -558,8 +767,6 @@ void setup()
   delay(100);
 
 
-  // Gyroscope ±250 °/s
-
   writeRegister(
       0x1B,
       0x00
@@ -567,8 +774,6 @@ void setup()
 
   delay(100);
 
-
-  // DLPF
 
   writeRegister(
       0x1A,
@@ -641,6 +846,9 @@ void setup()
   previousTime =
       micros();
 
+  previousVelocityTime =
+      millis();
+
 
   // ---------------------------------------------------
   // MOTOR SETUP
@@ -652,6 +860,13 @@ void setup()
 
 
   // ---------------------------------------------------
+  // ENCODER SETUP
+  // ---------------------------------------------------
+
+  setupEncoders();
+
+
+  // ---------------------------------------------------
   // PID INITIALIZATION
   // ---------------------------------------------------
 
@@ -659,11 +874,11 @@ void setup()
 
 
   // ---------------------------------------------------
-  // STAGE 4 MESSAGE
+  // STAGE 5 MESSAGE
   // ---------------------------------------------------
 
   Serial.println("================================");
-  Serial.println("       STAGE 4 - ANGLE PID");
+  Serial.println("    STAGE 5 - ENCODER FEEDBACK");
   Serial.println("================================");
   Serial.println();
 
@@ -677,6 +892,10 @@ void setup()
 
   Serial.println(
       "Inner angle PID active."
+  );
+
+  Serial.println(
+      "Wheel encoder feedback active."
   );
 
   Serial.println();
@@ -837,7 +1056,6 @@ void loop()
   previousAngle =
       currentAngle;
 
-
   previousError =
       error;
 
@@ -852,28 +1070,38 @@ void loop()
 
 
   // ---------------------------------------------------
+  // UPDATE WHEEL VELOCITY
+  // ---------------------------------------------------
+
+  updateWheelVelocity();
+
+
+  // ---------------------------------------------------
   // SERIAL MONITORING
   // ---------------------------------------------------
 
   Serial.print("Angle: ");
   Serial.print(currentAngle, 2);
 
-  Serial.print(" ° | Target: ");
-  Serial.print(targetAngle, 2);
-
   Serial.print(" ° | Error: ");
   Serial.print(error, 2);
-
-  Serial.print(" ° | P: ");
-  Serial.print(Kp * error, 2);
-
-  Serial.print(" | I: ");
-  Serial.print(Ki * errorSum, 2);
 
   Serial.print(" | Power: ");
   Serial.print(motorPower, 2);
 
-  Serial.print(" | dt: ");
+  Serial.print(" | L Count: ");
+  Serial.print(leftEncoderCount);
+
+  Serial.print(" | R Count: ");
+  Serial.print(rightEncoderCount);
+
+  Serial.print(" | L Vel: ");
+  Serial.print(leftVelocity, 2);
+
+  Serial.print(" cnt/s | R Vel: ");
+  Serial.print(rightVelocity, 2);
+
+  Serial.print(" cnt/s | dt: ");
   Serial.print(dt * 1000.0, 2);
 
   Serial.println(" ms");
