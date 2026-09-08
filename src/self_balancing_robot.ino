@@ -48,10 +48,6 @@ const int PWM_RESOLUTION = 8;
 // =====================================================
 // ENCODER COUNTERS
 // =====================================================
-//
-// volatile is required because these variables are
-// modified inside interrupt service routines.
-//
 
 volatile long leftEncoderCount = 0;
 volatile long rightEncoderCount = 0;
@@ -60,10 +56,6 @@ volatile long rightEncoderCount = 0;
 // =====================================================
 // ENCODER DIRECTION
 // =====================================================
-//
-// Change these later if the physical encoder direction
-// is opposite to the desired sign.
-//
 
 const int ENC_LEFT_SIGN = 1;
 const int ENC_RIGHT_SIGN = 1;
@@ -78,9 +70,6 @@ float rightVelocity = 0.0;
 
 long previousLeftCount = 0;
 long previousRightCount = 0;
-
-
-// Velocity measurement interval
 
 const unsigned long VELOCITY_INTERVAL_MS = 20;
 
@@ -119,8 +108,63 @@ const float TAU = 0.75;
 
 
 // =====================================================
+// OUTER VELOCITY PI CONTROLLER
+// =====================================================
+//
+// Stage 6:
+//
+// Target velocity
+//       ↓
+// Velocity PI
+//       ↓
+// Angle target
+//       ↓
+// Inner angle PID
+//
+// Velocity is measured in encoder counts/second.
+// We intentionally do not convert to RPM yet.
+// =====================================================
+
+// Desired robot wheel velocity
+
+float targetVelocity = 0.0;
+
+
+// Velocity PI gains
+
+float velocityKp = 0.02;
+float velocityKi = 0.01;
+
+
+// Velocity controller state
+
+float velocityError = 0.0;
+
+float velocityIntegral = 0.0;
+
+
+// Velocity integral protection
+
+const float VELOCITY_INTEGRAL_LIMIT = 5000.0;
+
+
+// Maximum angle command produced by velocity controller
+
+const float MAX_VELOCITY_ANGLE_COMMAND = 8.0;
+
+
+// =====================================================
+// VELOCITY CONTROL TIMING
+// =====================================================
+
+unsigned long previousVelocityControlTime = 0;
+
+
+// =====================================================
 // ANGLE PID CONTROLLER
 // =====================================================
+
+float baseTargetAngle = 0.0;
 
 float targetAngle = 0.0;
 
@@ -434,15 +478,6 @@ void readEncoderCounts(
 // =====================================================
 // CALCULATE WHEEL VELOCITY
 // =====================================================
-//
-// Velocity here is measured in:
-//
-//     encoder counts / second
-//
-// We intentionally use encoder counts/s at Stage 5.
-// Physical wheel RPM can be added later once the exact
-// encoder counts-per-revolution specification is verified.
-//
 
 void updateWheelVelocity()
 {
@@ -497,6 +532,120 @@ void updateWheelVelocity()
 
   previousVelocityTime =
       now;
+}
+
+
+// =====================================================
+// CALCULATE AVERAGE WHEEL VELOCITY
+// =====================================================
+//
+// The velocity controller uses the average of the two
+// wheel velocities as the robot's forward/backward
+// velocity measurement.
+//
+// =====================================================
+
+float calculateAverageVelocity()
+{
+  return (leftVelocity + rightVelocity) / 2.0;
+}
+
+
+// =====================================================
+// RESET VELOCITY PI
+// =====================================================
+
+void resetVelocityPI()
+{
+  velocityError = 0.0;
+
+  velocityIntegral = 0.0;
+
+  targetAngle =
+      baseTargetAngle;
+}
+
+
+// =====================================================
+// OUTER VELOCITY PI CONTROLLER
+// =====================================================
+
+void updateVelocityPI(float dt)
+{
+  if (dt <= 0.0)
+    return;
+
+
+  // ---------------------------------------------------
+  // MEASURED VELOCITY
+  // ---------------------------------------------------
+
+  float measuredVelocity =
+      calculateAverageVelocity();
+
+
+  // ---------------------------------------------------
+  // VELOCITY ERROR
+  // ---------------------------------------------------
+
+  velocityError =
+      targetVelocity - measuredVelocity;
+
+
+  // ---------------------------------------------------
+  // INTEGRAL
+  // ---------------------------------------------------
+
+  velocityIntegral +=
+      velocityError * dt;
+
+
+  velocityIntegral =
+      constrain(
+          velocityIntegral,
+          -VELOCITY_INTEGRAL_LIMIT,
+          VELOCITY_INTEGRAL_LIMIT
+      );
+
+
+  // ---------------------------------------------------
+  // PI TERMS
+  // ---------------------------------------------------
+
+  float P =
+      velocityKp * velocityError;
+
+  float I =
+      velocityKi * velocityIntegral;
+
+
+  // ---------------------------------------------------
+  // VELOCITY CONTROLLER OUTPUT
+  // ---------------------------------------------------
+
+  float velocityAngleCommand =
+      P + I;
+
+
+  // ---------------------------------------------------
+  // LIMIT ANGLE COMMAND
+  // ---------------------------------------------------
+
+  velocityAngleCommand =
+      constrain(
+          velocityAngleCommand,
+          -MAX_VELOCITY_ANGLE_COMMAND,
+          MAX_VELOCITY_ANGLE_COMMAND
+      );
+
+
+  // ---------------------------------------------------
+  // COMMAND INNER ANGLE LOOP
+  // ---------------------------------------------------
+
+  targetAngle =
+      baseTargetAngle
+      + velocityAngleCommand;
 }
 
 
@@ -637,7 +786,7 @@ void driveMotors(float power)
 
 
 // =====================================================
-// RESET PID
+// RESET ANGLE PID
 // =====================================================
 
 void resetPID()
@@ -849,6 +998,9 @@ void setup()
   previousVelocityTime =
       millis();
 
+  previousVelocityControlTime =
+      millis();
+
 
   // ---------------------------------------------------
   // MOTOR SETUP
@@ -867,18 +1019,26 @@ void setup()
 
 
   // ---------------------------------------------------
-  // PID INITIALIZATION
+  // CONTROLLER INITIALIZATION
   // ---------------------------------------------------
+
+  baseTargetAngle =
+      currentAngle;
+
+  targetAngle =
+      baseTargetAngle;
 
   resetPID();
 
+  resetVelocityPI();
+
 
   // ---------------------------------------------------
-  // STAGE 5 MESSAGE
+  // STAGE 6 MESSAGE
   // ---------------------------------------------------
 
   Serial.println("================================");
-  Serial.println("    STAGE 5 - ENCODER FEEDBACK");
+  Serial.println("   STAGE 6 - VELOCITY PI CONTROL");
   Serial.println("================================");
   Serial.println();
 
@@ -898,19 +1058,33 @@ void setup()
       "Wheel encoder feedback active."
   );
 
+  Serial.println(
+      "Outer velocity PI active."
+  );
+
   Serial.println();
 
-  Serial.print("Kp: ");
+  Serial.print("Angle Kp: ");
   Serial.println(Kp);
 
-  Serial.print("Ki: ");
+  Serial.print("Angle Ki: ");
   Serial.println(Ki);
 
-  Serial.print("Kd: ");
+  Serial.print("Angle Kd: ");
   Serial.println(Kd);
 
-  Serial.print("Target angle: ");
-  Serial.print(targetAngle, 2);
+  Serial.print("Velocity Kp: ");
+  Serial.println(velocityKp);
+
+  Serial.print("Velocity Ki: ");
+  Serial.println(velocityKi);
+
+  Serial.print("Target velocity: ");
+  Serial.print(targetVelocity, 2);
+  Serial.println(" cnt/s");
+
+  Serial.print("Base target angle: ");
+  Serial.print(baseTargetAngle, 2);
   Serial.println(" °");
 
   Serial.println();
@@ -970,6 +1144,8 @@ void loop()
     driveMotors(0);
 
     resetPID();
+
+    resetVelocityPI();
 
     delay(100);
 
@@ -1042,6 +1218,24 @@ void loop()
 
 
   // ---------------------------------------------------
+  // UPDATE WHEEL VELOCITY
+  // ---------------------------------------------------
+
+  updateWheelVelocity();
+
+
+  // ---------------------------------------------------
+  // UPDATE VELOCITY PI
+  // ---------------------------------------------------
+  //
+  // The velocity loop runs using the same main-loop
+  // timing. Encoder velocity itself updates every 20 ms.
+  //
+
+  updateVelocityPI(dt);
+
+
+  // ---------------------------------------------------
   // ANGLE PID
   // ---------------------------------------------------
 
@@ -1070,20 +1264,32 @@ void loop()
 
 
   // ---------------------------------------------------
-  // UPDATE WHEEL VELOCITY
-  // ---------------------------------------------------
-
-  updateWheelVelocity();
-
-
-  // ---------------------------------------------------
   // SERIAL MONITORING
   // ---------------------------------------------------
+
+  float measuredVelocity =
+      calculateAverageVelocity();
+
 
   Serial.print("Angle: ");
   Serial.print(currentAngle, 2);
 
-  Serial.print(" ° | Error: ");
+  Serial.print(" ° | Target Angle: ");
+  Serial.print(targetAngle, 2);
+
+  Serial.print(" ° | Vel Target: ");
+  Serial.print(targetVelocity, 2);
+
+  Serial.print(" | Vel: ");
+  Serial.print(measuredVelocity, 2);
+
+  Serial.print(" cnt/s | Vel Error: ");
+  Serial.print(velocityError, 2);
+
+  Serial.print(" | Vel I: ");
+  Serial.print(velocityIntegral, 2);
+
+  Serial.print(" | Angle Error: ");
   Serial.print(error, 2);
 
   Serial.print(" | Power: ");
@@ -1098,10 +1304,10 @@ void loop()
   Serial.print(" | L Vel: ");
   Serial.print(leftVelocity, 2);
 
-  Serial.print(" cnt/s | R Vel: ");
+  Serial.print(" | R Vel: ");
   Serial.print(rightVelocity, 2);
 
-  Serial.print(" cnt/s | dt: ");
+  Serial.print(" | dt: ");
   Serial.print(dt * 1000.0, 2);
 
   Serial.println(" ms");
