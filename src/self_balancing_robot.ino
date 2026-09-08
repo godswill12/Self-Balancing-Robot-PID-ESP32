@@ -110,48 +110,27 @@ const float TAU = 0.75;
 // =====================================================
 // OUTER VELOCITY PI CONTROLLER
 // =====================================================
-//
-// Stage 7:
-//
-// Target velocity
-//       ↓
-// Velocity PI
-//       ↓
-// Gating + Anti-Windup
-//       ↓
-// Angle target
-//       ↓
-// Inner angle PID
-//
-// Velocity is measured in encoder counts/second.
-// We intentionally do not convert to RPM yet.
-// =====================================================
-
-
-// Desired robot wheel velocity
 
 float targetVelocity = 0.0;
 
-
-// Velocity PI gains
-
 float velocityKp = 0.02;
 float velocityKi = 0.01;
-
-
-// Velocity controller state
 
 float velocityError = 0.0;
 
 float velocityIntegral = 0.0;
 
 
-// Velocity integral protection
+// =====================================================
+// VELOCITY INTEGRAL PROTECTION
+// =====================================================
 
 const float VELOCITY_INTEGRAL_LIMIT = 5000.0;
 
 
-// Maximum angle command produced by velocity controller
+// =====================================================
+// MAXIMUM VELOCITY ANGLE COMMAND
+// =====================================================
 
 const float MAX_VELOCITY_ANGLE_COMMAND = 8.0;
 
@@ -160,19 +139,58 @@ const float MAX_VELOCITY_ANGLE_COMMAND = 8.0;
 // VELOCITY LOOP GATING
 // =====================================================
 //
-// The outer velocity controller is only active when
-// the robot is reasonably close to its balance angle.
+// The velocity loop is only active when the robot is
+// reasonably close to its balance angle.
 //
-// If the robot moves farther than this angle from
-// baseTargetAngle, the velocity loop is disabled and
-// targetAngle returns to baseTargetAngle.
+// Stage 7:
+// ±10° → velocity loop disabled.
 //
-// This is NOT full fall detection.
 // =====================================================
 
 const float VELOCITY_LOOP_ANGLE_ERROR_LIMIT = 10.0;
 
 bool velocityLoopEnabled = false;
+
+
+// =====================================================
+// STAGE 8 - FALL DETECTION
+// =====================================================
+//
+// Fall detection is intentionally separate from velocity
+// loop gating.
+//
+// Stage 7:
+// ±10° → velocity loop OFF
+//
+// Stage 8:
+// ±25° → robot considered FALLEN
+//
+// =====================================================
+
+const float FALL_ANGLE_LIMIT = 25.0;
+
+
+// =====================================================
+// FALL RECOVERY ANGLE
+// =====================================================
+//
+// Once the robot has been declared fallen, it must return
+// closer to its balance angle before the controllers are
+// allowed to restart.
+//
+// This prevents the robot from immediately restarting
+// while it is still significantly tilted.
+//
+// =====================================================
+
+const float FALL_RECOVERY_ANGLE_LIMIT = 10.0;
+
+
+// =====================================================
+// ROBOT FALL STATE
+// =====================================================
+
+bool robotFallen = false;
 
 
 // =====================================================
@@ -560,12 +578,6 @@ void updateWheelVelocity()
 // =====================================================
 // CALCULATE AVERAGE WHEEL VELOCITY
 // =====================================================
-//
-// The velocity controller uses the average of the two
-// wheel velocities as the robot's forward/backward
-// velocity measurement.
-//
-// =====================================================
 
 float calculateAverageVelocity()
 {
@@ -593,18 +605,30 @@ void resetVelocityPI()
 // =====================================================
 // OUTER VELOCITY PI CONTROLLER
 // =====================================================
-//
-// Stage 7 additions:
-//
-// 1. Velocity-loop gating
-// 2. Integral anti-windup
-//
-// =====================================================
 
 void updateVelocityPI(float dt)
 {
   if (dt <= 0.0)
     return;
+
+
+  // ---------------------------------------------------
+  // DO NOT RUN VELOCITY CONTROL WHILE FALLEN
+  // ---------------------------------------------------
+
+  if (robotFallen)
+  {
+    velocityLoopEnabled = false;
+
+    velocityError = 0.0;
+
+    velocityIntegral = 0.0;
+
+    targetAngle =
+        baseTargetAngle;
+
+    return;
+  }
 
 
   // ---------------------------------------------------
@@ -626,17 +650,6 @@ void updateVelocityPI(float dt)
   // ---------------------------------------------------
   // VELOCITY LOOP GATING
   // ---------------------------------------------------
-  //
-  // Compare the current angle with the physical
-  // balance angle established during startup.
-  //
-  // If the robot is too far away from the balance
-  // region, disable the outer velocity controller.
-  //
-  // This prevents the velocity controller from
-  // commanding additional leaning while the robot
-  // is already significantly displaced.
-  // ---------------------------------------------------
 
   float angleErrorFromBalance =
       currentAngle - baseTargetAngle;
@@ -647,8 +660,6 @@ void updateVelocityPI(float dt)
   {
     velocityLoopEnabled = false;
 
-    // Clear the velocity integral so the controller
-    // cannot resume with accumulated error.
     velocityIntegral = 0.0;
 
     targetAngle =
@@ -671,11 +682,6 @@ void updateVelocityPI(float dt)
 
   // ---------------------------------------------------
   // PROVISIONAL INTEGRAL
-  // ---------------------------------------------------
-  //
-  // Calculate what the integral WOULD become.
-  // We only accept this update if anti-windup
-  // conditions allow it.
   // ---------------------------------------------------
 
   float proposedIntegral =
@@ -718,21 +724,6 @@ void updateVelocityPI(float dt)
   // ---------------------------------------------------
   // INTEGRAL ANTI-WINDUP
   // ---------------------------------------------------
-  //
-  // If the velocity controller is not saturated,
-  // accept the integral update.
-  //
-  // If the controller IS saturated:
-  //
-  // Positive saturation:
-  //   only integrate if velocity error is negative.
-  //
-  // Negative saturation:
-  //   only integrate if velocity error is positive.
-  //
-  // This prevents the integral from making an existing
-  // saturation worse.
-  // ---------------------------------------------------
 
   bool outputSaturated =
       (velocityAngleCommand !=
@@ -748,10 +739,6 @@ void updateVelocityPI(float dt)
     if (velocityAngleCommand >
         MAX_VELOCITY_ANGLE_COMMAND)
     {
-      // Controller is saturated positively.
-      //
-      // Negative error will reduce the output.
-
       if (velocityError < 0.0)
       {
         errorReducesSaturation = true;
@@ -761,10 +748,6 @@ void updateVelocityPI(float dt)
     else if (velocityAngleCommand <
              -MAX_VELOCITY_ANGLE_COMMAND)
     {
-      // Controller is saturated negatively.
-      //
-      // Positive error will reduce the output.
-
       if (velocityError > 0.0)
       {
         errorReducesSaturation = true;
@@ -836,8 +819,6 @@ void setupMotors()
 
   digitalWrite(STBY_PIN, HIGH);
 
-
-  // Same LEDC API used in previous stages.
 
   ledcSetup(0, PWM_FREQ, PWM_RESOLUTION);
   ledcSetup(1, PWM_FREQ, PWM_RESOLUTION);
@@ -978,13 +959,29 @@ void resetPID()
 
 float calculateAnglePID(float dt)
 {
+  // ---------------------------------------------------
+  // DO NOT RUN ANGLE PID WHILE FALLEN
+  // ---------------------------------------------------
+
+  if (robotFallen)
+  {
+    error = 0.0;
+
+    return 0.0;
+  }
+
+
+  // ---------------------------------------------------
   // ERROR
+  // ---------------------------------------------------
 
   error =
       targetAngle - currentAngle;
 
 
+  // ---------------------------------------------------
   // INTEGRAL
+  // ---------------------------------------------------
 
   errorSum +=
       error * dt;
@@ -998,7 +995,9 @@ float calculateAnglePID(float dt)
       );
 
 
+  // ---------------------------------------------------
   // ANGULAR RATE
+  // ---------------------------------------------------
 
   float angleRate = 0.0;
 
@@ -1011,7 +1010,9 @@ float calculateAnglePID(float dt)
   }
 
 
+  // ---------------------------------------------------
   // PID TERMS
+  // ---------------------------------------------------
 
   float P =
       Kp * error;
@@ -1023,7 +1024,9 @@ float calculateAnglePID(float dt)
       -Kd * angleRate;
 
 
+  // ---------------------------------------------------
   // TOTAL OUTPUT
+  // ---------------------------------------------------
 
   float output =
       P + I + D;
@@ -1038,6 +1041,120 @@ float calculateAnglePID(float dt)
 
 
   return output;
+}
+
+
+// =====================================================
+// FALL DETECTION
+// =====================================================
+//
+// Returns true when the robot is sufficiently far from
+// its physical balance angle.
+//
+// =====================================================
+
+bool detectFall()
+{
+  float angleErrorFromBalance =
+      currentAngle - baseTargetAngle;
+
+
+  return (
+      fabs(angleErrorFromBalance)
+      >= FALL_ANGLE_LIMIT
+  );
+}
+
+
+// =====================================================
+// ENTER FALLEN STATE
+// =====================================================
+//
+// This function performs the complete controller
+// shutdown/reset sequence.
+//
+// =====================================================
+
+void enterFallenState()
+{
+  robotFallen = true;
+
+  // Immediately stop the motors.
+
+  driveMotors(0);
+
+
+  // Reset inner angle controller.
+
+  resetPID();
+
+
+  // Reset outer velocity controller.
+
+  resetVelocityPI();
+
+
+  // Force neutral target.
+
+  targetAngle =
+      baseTargetAngle;
+
+
+  Serial.println();
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  Serial.println("          ROBOT FALL DETECTED");
+  Serial.println("          MOTORS DISABLED");
+  Serial.println("          CONTROLLERS RESET");
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  Serial.println();
+}
+
+
+// =====================================================
+// FALL RECOVERY
+// =====================================================
+//
+// The robot must return within the recovery angle before
+// normal control is allowed to restart.
+//
+// =====================================================
+
+void checkFallRecovery()
+{
+  if (!robotFallen)
+    return;
+
+
+  float angleErrorFromBalance =
+      currentAngle - baseTargetAngle;
+
+
+  if (fabs(angleErrorFromBalance) <=
+      FALL_RECOVERY_ANGLE_LIMIT)
+  {
+    robotFallen = false;
+
+
+    // Reset both controllers again immediately before
+    // returning to normal operation.
+
+    resetPID();
+
+    resetVelocityPI();
+
+
+    targetAngle =
+        baseTargetAngle;
+
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("       ROBOT RECOVERY DETECTED");
+    Serial.println("       CONTROLLERS RESET");
+    Serial.println("       NORMAL CONTROL ENABLED");
+    Serial.println("========================================");
+    Serial.println();
+  }
 }
 
 
@@ -1198,17 +1315,22 @@ void setup()
   targetAngle =
       baseTargetAngle;
 
+
+  robotFallen =
+      false;
+
+
   resetPID();
 
   resetVelocityPI();
 
 
   // ---------------------------------------------------
-  // STAGE 7 MESSAGE
+  // STAGE 8 MESSAGE
   // ---------------------------------------------------
 
   Serial.println("==============================================");
-  Serial.println(" STAGE 7 - VELOCITY GATING + ANTI-WINDUP");
+  Serial.println(" STAGE 8 - FALL DETECTION + RESET LOGIC");
   Serial.println("==============================================");
   Serial.println();
 
@@ -1240,6 +1362,14 @@ void setup()
       "Velocity integral anti-windup active."
   );
 
+  Serial.println(
+      "Fall detection active."
+  );
+
+  Serial.println(
+      "Controller reset on fall active."
+  );
+
   Serial.println();
 
   Serial.print("Angle Kp: ");
@@ -1266,6 +1396,14 @@ void setup()
 
   Serial.print("Velocity loop angle limit: ");
   Serial.print(VELOCITY_LOOP_ANGLE_ERROR_LIMIT);
+  Serial.println(" °");
+
+  Serial.print("Fall angle limit: ");
+  Serial.print(FALL_ANGLE_LIMIT);
+  Serial.println(" °");
+
+  Serial.print("Fall recovery angle limit: ");
+  Serial.print(FALL_RECOVERY_ANGLE_LIMIT);
   Serial.println(" °");
 
   Serial.print("Target velocity: ");
@@ -1414,14 +1552,32 @@ void loop()
 
 
   // ---------------------------------------------------
-  // UPDATE VELOCITY PI
+  // FALL DETECTION
   // ---------------------------------------------------
   //
-  // Stage 7:
+  // Only enter the fallen state if the robot has crossed
+  // the Stage 8 fall threshold.
   //
-  // The velocity loop is gated according to angle.
-  // Its integral is protected against windup.
-  //
+
+  if (!robotFallen)
+  {
+    if (detectFall())
+    {
+      enterFallenState();
+    }
+  }
+
+
+  // ---------------------------------------------------
+  // FALL RECOVERY
+  // ---------------------------------------------------
+
+  checkFallRecovery();
+
+
+  // ---------------------------------------------------
+  // UPDATE VELOCITY PI
+  // ---------------------------------------------------
 
   updateVelocityPI(dt);
 
@@ -1448,10 +1604,22 @@ void loop()
   // ---------------------------------------------------
   // MOTOR COMMAND
   // ---------------------------------------------------
+  //
+  // The fallen-state check is repeated here so that
+  // entering the fallen state always results in zero
+  // motor output.
+  //
 
-  driveMotors(
-      motorPower
-  );
+  if (robotFallen)
+  {
+    driveMotors(0);
+  }
+  else
+  {
+    driveMotors(
+        motorPower
+    );
+  }
 
 
   // ---------------------------------------------------
@@ -1485,6 +1653,13 @@ void loop()
       velocityLoopEnabled
       ? "ON"
       : "OFF"
+  );
+
+  Serial.print(" | Fall State: ");
+  Serial.print(
+      robotFallen
+      ? "FALLEN"
+      : "SAFE"
   );
 
   Serial.print(" | Angle Error: ");
