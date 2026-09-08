@@ -1,4 +1,5 @@
 #include <Wire.h>
+#include <math.h>
 
 // =====================================================
 // MPU6050
@@ -29,15 +30,29 @@ const int PWM_RESOLUTION = 8;
 
 
 // =====================================================
-// MPU6050 REGISTER WRITE
+// SENSOR VALUES
+// =====================================================
+
+float gyroX = 0.0;
+float gyroXOffset = 0.0;
+
+float accelX = 0.0;
+float accelY = 0.0;
+float accelZ = 0.0;
+
+float accelAngle = 0.0;
+
+
+// =====================================================
+// WRITE MPU6050 REGISTER
 // =====================================================
 
 void writeRegister(byte reg, byte value)
 {
-    Wire.beginTransmission(MPU_ADDR);
-    Wire.write(reg);
-    Wire.write(value);
-    Wire.endTransmission();
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
 }
 
 
@@ -47,135 +62,200 @@ void writeRegister(byte reg, byte value)
 
 bool readMPU(float &gx, float &ax, float &ay, float &az)
 {
-    Wire.beginTransmission(MPU_ADDR);
-    Wire.write(0x3B);
+  Wire.beginTransmission(MPU_ADDR);
 
-    if (Wire.endTransmission(false) != 0)
-        return false;
+  Wire.write(0x3B);
 
-    if (Wire.requestFrom(MPU_ADDR, 14) != 14)
-        return false;
+  if (Wire.endTransmission(false) != 0)
+    return false;
 
-    int16_t rawAccelX = (Wire.read() << 8) | Wire.read();
-    int16_t rawAccelY = (Wire.read() << 8) | Wire.read();
-    int16_t rawAccelZ = (Wire.read() << 8) | Wire.read();
+  if (Wire.requestFrom(MPU_ADDR, 14) != 14)
+    return false;
 
-    // Skip temperature
-    Wire.read();
-    Wire.read();
+  int16_t rawAccelX = (Wire.read() << 8) | Wire.read();
+  int16_t rawAccelY = (Wire.read() << 8) | Wire.read();
+  int16_t rawAccelZ = (Wire.read() << 8) | Wire.read();
 
-    int16_t rawGyroX = (Wire.read() << 8) | Wire.read();
+  // Temperature
+  Wire.read();
+  Wire.read();
 
-    // Skip remaining gyro axes
-    Wire.read();
-    Wire.read();
-    Wire.read();
-    Wire.read();
+  int16_t rawGyroX = (Wire.read() << 8) | Wire.read();
 
-    ax = rawAccelX / 16384.0;
-    ay = rawAccelY / 16384.0;
-    az = rawAccelZ / 16384.0;
+  // Remaining gyro axes
+  Wire.read();
+  Wire.read();
+  Wire.read();
+  Wire.read();
 
-    gx = rawGyroX / 131.0;
+  ax = rawAccelX / 16384.0;
+  ay = rawAccelY / 16384.0;
+  az = rawAccelZ / 16384.0;
 
-    return true;
+  gx = rawGyroX / 131.0;
+
+  return true;
 }
 
 
 // =====================================================
-// MOTOR SETUP
+// CALCULATE ACCELEROMETER TILT ANGLE
+// =====================================================
+
+float calculateAccelAngle(float ay, float az)
+{
+  return atan2(ay, az) * 180.0 / PI;
+}
+
+
+// =====================================================
+// GYRO CALIBRATION
+// =====================================================
+
+void calibrateGyro()
+{
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       GYRO CALIBRATION");
+  Serial.println("================================");
+  Serial.println();
+
+  Serial.println("Keep the robot COMPLETELY STILL.");
+  Serial.println("Calibration starts in 3 seconds...");
+
+  delay(3000);
+
+  const int samples = 1000;
+
+  float sum = 0.0;
+  int validSamples = 0;
+
+  Serial.println("Calibrating...");
+
+  for (int i = 0; i < samples; i++)
+  {
+    float gx;
+    float ax;
+    float ay;
+    float az;
+
+    if (readMPU(gx, ax, ay, az))
+    {
+      sum += gx;
+      validSamples++;
+    }
+
+    delay(2);
+  }
+
+  if (validSamples == 0)
+  {
+    Serial.println("ERROR: MPU6050 NOT RESPONDING!");
+
+    while (true)
+    {
+      delay(100);
+    }
+  }
+
+  gyroXOffset = sum / validSamples;
+
+  Serial.println();
+  Serial.println("Calibration complete.");
+
+  Serial.print("Valid samples: ");
+  Serial.println(validSamples);
+
+  Serial.print("Gyro X offset: ");
+  Serial.print(gyroXOffset, 3);
+  Serial.println(" °/s");
+
+  Serial.println();
+}
+
+
+// =====================================================
+// MOTOR CONTROL
 // =====================================================
 
 void setupMotors()
 {
-    pinMode(STBY_PIN, OUTPUT);
+  pinMode(STBY_PIN, OUTPUT);
 
-    pinMode(AIN1_PIN, OUTPUT);
-    pinMode(AIN2_PIN, OUTPUT);
+  pinMode(AIN1_PIN, OUTPUT);
+  pinMode(AIN2_PIN, OUTPUT);
 
-    pinMode(BIN1_PIN, OUTPUT);
-    pinMode(BIN2_PIN, OUTPUT);
+  pinMode(BIN1_PIN, OUTPUT);
+  pinMode(BIN2_PIN, OUTPUT);
 
-    digitalWrite(STBY_PIN, HIGH);
+  digitalWrite(STBY_PIN, HIGH);
 
-    ledcSetup(0, PWM_FREQ, PWM_RESOLUTION);
-    ledcSetup(1, PWM_FREQ, PWM_RESOLUTION);
+  // PlatformIO / older ESP32 Arduino Core API
+  ledcSetup(0, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(1, PWM_FREQ, PWM_RESOLUTION);
 
-    ledcAttachPin(PWMA_PIN, 0);
-    ledcAttachPin(PWMB_PIN, 1);
+  ledcAttachPin(PWMA_PIN, 0);
+  ledcAttachPin(PWMB_PIN, 1);
 
-    ledcWrite(0, 0);
-    ledcWrite(1, 0);
+  ledcWrite(0, 0);
+  ledcWrite(1, 0);
 }
 
-
-// =====================================================
-// MOTOR A
-// =====================================================
 
 void driveMotorA(int speed)
 {
-    speed = constrain(speed, -255, 255);
+  speed = constrain(speed, -255, 255);
 
-    if (speed > 0)
-    {
-        digitalWrite(AIN1_PIN, HIGH);
-        digitalWrite(AIN2_PIN, LOW);
-    }
-    else if (speed < 0)
-    {
-        digitalWrite(AIN1_PIN, LOW);
-        digitalWrite(AIN2_PIN, HIGH);
-    }
-    else
-    {
-        digitalWrite(AIN1_PIN, LOW);
-        digitalWrite(AIN2_PIN, LOW);
-    }
+  if (speed > 0)
+  {
+    digitalWrite(AIN1_PIN, HIGH);
+    digitalWrite(AIN2_PIN, LOW);
+  }
+  else if (speed < 0)
+  {
+    digitalWrite(AIN1_PIN, LOW);
+    digitalWrite(AIN2_PIN, HIGH);
+  }
+  else
+  {
+    digitalWrite(AIN1_PIN, LOW);
+    digitalWrite(AIN2_PIN, LOW);
+  }
 
-    ledcWrite(0, abs(speed));
+  ledcWrite(0, abs(speed));
 }
 
-
-// =====================================================
-// MOTOR B
-// =====================================================
 
 void driveMotorB(int speed)
 {
-    speed = constrain(speed, -255, 255);
+  speed = constrain(speed, -255, 255);
 
-    if (speed > 0)
-    {
-        digitalWrite(BIN1_PIN, HIGH);
-        digitalWrite(BIN2_PIN, LOW);
-    }
-    else if (speed < 0)
-    {
-        digitalWrite(BIN1_PIN, LOW);
-        digitalWrite(BIN2_PIN, HIGH);
-    }
-    else
-    {
-        digitalWrite(BIN1_PIN, LOW);
-        digitalWrite(BIN2_PIN, LOW);
-    }
+  if (speed > 0)
+  {
+    digitalWrite(BIN1_PIN, HIGH);
+    digitalWrite(BIN2_PIN, LOW);
+  }
+  else if (speed < 0)
+  {
+    digitalWrite(BIN1_PIN, LOW);
+    digitalWrite(BIN2_PIN, HIGH);
+  }
+  else
+  {
+    digitalWrite(BIN1_PIN, LOW);
+    digitalWrite(BIN2_PIN, LOW);
+  }
 
-    ledcWrite(1, abs(speed));
+  ledcWrite(1, abs(speed));
 }
 
 
-// =====================================================
-// DRIVE BOTH MOTORS
-// =====================================================
-
-void driveMotors(int speed)
+void driveMotors(float power)
 {
-    driveMotorA(speed);
+  int pwm = (int)power;
 
-    // Right motor is physically mounted in the opposite
-    // orientation, so its direction is inverted.
-    driveMotorB(-speed);
+  driveMotorA(pwm);
+  driveMotorB(-pwm);
 }
 
 
@@ -185,34 +265,77 @@ void driveMotors(int speed)
 
 void setup()
 {
-    Serial.begin(115200);
+  Serial.begin(115200);
 
-    delay(500);
+  delay(500);
 
-    // Initialize I2C
-    Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(400000);
+  // ---------------------------------------------------
+  // I2C
+  // ---------------------------------------------------
 
-    delay(100);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
 
-    // Wake MPU6050
-    writeRegister(0x6B, 0x00);
+  delay(100);
 
-    // Accelerometer ±2g
-    writeRegister(0x1C, 0x00);
+  // ---------------------------------------------------
+  // MPU6050 CONFIGURATION
+  // ---------------------------------------------------
 
-    // Gyroscope ±250 °/s
-    writeRegister(0x1B, 0x00);
+  writeRegister(0x6B, 0x00);   // Wake up MPU6050
+  delay(100);
 
-    // Configure digital low-pass filter
-    writeRegister(0x1A, 0x01);
+  writeRegister(0x1C, 0x00);   // Accelerometer ±2g
+  delay(100);
 
-    setupMotors();
+  writeRegister(0x1B, 0x00);   // Gyroscope ±250 °/s
+  delay(100);
 
-    Serial.println("================================");
-    Serial.println("ESP32 SELF-BALANCING ROBOT");
-    Serial.println("Hardware Baseline");
-    Serial.println("================================");
+  writeRegister(0x1A, 0x01);   // DLPF configuration
+  delay(100);
+
+  // ---------------------------------------------------
+  // GYRO CALIBRATION
+  // ---------------------------------------------------
+
+  calibrateGyro();
+
+  // ---------------------------------------------------
+  // INITIAL ACCELEROMETER ANGLE
+  // ---------------------------------------------------
+
+  float gx;
+  float ax;
+  float ay;
+  float az;
+
+  if (readMPU(gx, ax, ay, az))
+  {
+    accelAngle = calculateAccelAngle(ay, az);
+  }
+
+  // ---------------------------------------------------
+  // MOTORS
+  // ---------------------------------------------------
+
+  setupMotors();
+
+  driveMotors(0);
+
+  Serial.println("================================");
+  Serial.println("       STAGE 2 - SENSOR TEST");
+  Serial.println("================================");
+  Serial.println();
+
+  Serial.println("Gyro calibration + accelerometer");
+  Serial.println("tilt estimation active.");
+  Serial.println();
+
+  Serial.print("Initial accel angle: ");
+  Serial.print(accelAngle, 2);
+  Serial.println(" °");
+
+  Serial.println();
 }
 
 
@@ -222,36 +345,72 @@ void setup()
 
 void loop()
 {
-    float gx;
-    float ax;
-    float ay;
-    float az;
+  float gx;
+  float ax;
+  float ay;
+  float az;
 
-    if (readMPU(gx, ax, ay, az))
-    {
-        Serial.print("Accel: ");
-        Serial.print(ax, 2);
-        Serial.print(" g, ");
+  // ---------------------------------------------------
+  // READ MPU6050
+  // ---------------------------------------------------
 
-        Serial.print(ay, 2);
-        Serial.print(" g, ");
-
-        Serial.print(az, 2);
-        Serial.print(" g | Gyro X: ");
-        Serial.print(gx, 2);
-        Serial.println(" deg/s");
-    }
-    else
-    {
-        Serial.println("MPU6050 read error!");
-    }
-
-    // Simple motor test
-    driveMotors(60);
-
-    delay(1000);
+  if (!readMPU(gx, ax, ay, az))
+  {
+    Serial.println("MPU6050 read error!");
 
     driveMotors(0);
 
-    delay(1000);
+    delay(100);
+
+    return;
+  }
+
+  // ---------------------------------------------------
+  // STORE SENSOR VALUES
+  // ---------------------------------------------------
+
+  gyroX = gx;
+
+  accelX = ax;
+  accelY = ay;
+  accelZ = az;
+
+  // ---------------------------------------------------
+  // APPLY GYRO CALIBRATION
+  // ---------------------------------------------------
+
+  float calibratedGyroX = gyroX - gyroXOffset;
+
+  // ---------------------------------------------------
+  // CALCULATE ACCELEROMETER TILT ANGLE
+  // ---------------------------------------------------
+
+  accelAngle = calculateAccelAngle(accelY, accelZ);
+
+  // ---------------------------------------------------
+  // SERIAL OUTPUT
+  // ---------------------------------------------------
+
+  Serial.print("Raw Gyro X: ");
+  Serial.print(gyroX, 2);
+
+  Serial.print(" °/s | Calibrated Gyro X: ");
+  Serial.print(calibratedGyroX, 2);
+
+  Serial.print(" °/s | Accel Angle: ");
+  Serial.print(accelAngle, 2);
+
+  Serial.print(" ° | Accel: ");
+  Serial.print(accelX, 2);
+  Serial.print(", ");
+  Serial.print(accelY, 2);
+  Serial.print(", ");
+  Serial.print(accelZ, 2);
+
+  Serial.println();
+
+  // Motors remain stopped in Stage 2
+  driveMotors(0);
+
+  delay(50);
 }
